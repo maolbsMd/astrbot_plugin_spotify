@@ -1,27 +1,31 @@
 import os
 import json
+import re # 引入正则库，用于清理错误的链接格式
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from astrbot.api.all import *
 from astrbot.api.event import filter
+from astrbot.api.star import StarTools # 引入核心工具
 
-class SpotifyController(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self.sp = None
-        self.auth_manager = None
-        # 初始化时加载一次配置
-        self._load_config_and_init()
+# ... (保持原有的 class 声明和 __init__)
 
     def _load_config_and_init(self):
-        """核心逻辑：从 config.json 实时加载配置，并初始化客户端"""
-        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        """核心逻辑：从 WebUI 的正确数据目录实时加载配置"""
         config = {}
         
-        # 兼容 WebUI 动态生成的 config.json
-        if os.path.exists(config_path):
+        # 🌟 关键修复：使用 StarTools 指向 WebUI 真正保存配置的独立数据目录
+        data_dir = StarTools.get_data_dir()
+        config_path = os.path.join(data_dir, "config.json")
+        
+        # 本地代码目录的兜底文件
+        fallback_path = os.path.join(os.path.dirname(__file__), "config.json")
+        
+        # 优先读取 WebUI 生成的配置，如果没有，再找源码目录下的
+        load_path = config_path if os.path.exists(config_path) else fallback_path
+        
+        if os.path.exists(load_path):
             try:
-                with open(config_path, "r", encoding="utf-8") as f:
+                with open(load_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
             except Exception:
                 pass
@@ -30,7 +34,15 @@ class SpotifyController(Star):
         client_secret = config.get("client_secret", "")
         redirect_uri = config.get("redirect_uri", "http://127.0.0.1:6198/callback")
         
-        if not client_id or not client_secret:
+        # 🛡️ 终极防呆：如果用户从聊天软件复制配置，不小心带入了 Markdown 括号
+        # 这里用正则强制提取纯净的 URL，坚决不把 Unsafe 链接传给 Spotify
+        if "[" in redirect_uri or "]" in redirect_uri:
+            match = re.search(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', redirect_uri)
+            if match:
+                redirect_uri = match.group(0)
+        
+        # 如果读取到的还是未修改的占位符，直接挂起等待配置
+        if not client_id or not client_secret or client_id == "你的_CLIENT_ID" or client_id == "YOUR_SPOTIFY_CLIENT_ID":
             return
             
         scope = "user-modify-playback-state user-read-playback-state user-library-modify"
