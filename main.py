@@ -6,45 +6,46 @@ from spotipy.oauth2 import SpotifyOAuth
 from astrbot.api.all import *
 from astrbot.api.event import filter
 
+# 重新启用 @register，这是让框架主动注入 WebUI 配置的钥匙
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.0.0")
 class SpotifyController(Star):
-    def __init__(self, context: Context):
+    # 增加 config: dict = None，既能接收 WebUI 配置，又能防止框架报错
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.sp = None
         self.auth_manager = None
-        # 初始化时加载一次配置
-        self._load_config_and_init()
-
-    def _load_config_and_init(self):
-        """核心逻辑：从插件目录实时加载 WebUI 保存的配置"""
-        config = {}
         
-        # WebUI 保存的配置存放在当前代码同目录下
-        config_path = os.path.join(os.path.dirname(__file__), "config.json")
-        
-        if os.path.exists(config_path):
+        # 🌟 核心破局点：优先吃下 WebUI 传过来的配置，如果没有，再兜底去读本地模板
+        if config:
+            self.config = config
+        else:
+            config_path = os.path.join(os.path.dirname(__file__), "config.json")
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+                    self.config = json.load(f)
             except Exception:
-                pass
+                self.config = {}
                 
-        # 加个 .strip()，防止在 WebUI 复制粘贴时不小心多带了空格
-        client_id = config.get("client_id", "").strip()
-        client_secret = config.get("client_secret", "").strip()
-        redirect_uri = config.get("redirect_uri", "http://127.0.0.1:6198/callback").strip()
+        # 初始化 Spotify
+        self._init_spotify()
+
+    def _init_spotify(self):
+        """真正的配置加载逻辑，不再去读死文件，而是读内存里的 config 字典"""
+        client_id = self.config.get("client_id", "").strip()
+        client_secret = self.config.get("client_secret", "").strip()
+        redirect_uri = self.config.get("redirect_uri", "http://127.0.0.1:6198/callback").strip()
         
-        # 终极防呆：强制提取纯净的 URL，过滤掉可能的 Markdown 括号
+        # 清理用户从 WebUI 复制时可能带入的 Markdown 乱码
         if "[" in redirect_uri or "]" in redirect_uri:
             match = re.search(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', redirect_uri)
             if match:
                 redirect_uri = match.group(0)
         
-        # 如果读取到的还是未修改的占位符或者为空，直接挂起等待配置
+        # 检查是否还是占位符
         if not client_id or not client_secret or client_id == "你的_CLIENT_ID" or client_id == "YOUR_SPOTIFY_CLIENT_ID":
             return
             
         scope = "user-modify-playback-state user-read-playback-state user-library-modify"
-        
         self.auth_manager = SpotifyOAuth(
             client_id=client_id,
             client_secret=client_secret,
@@ -64,9 +65,7 @@ class SpotifyController(Star):
     @filter.command("spotify登录")
     async def spotify_login(self, event: AstrMessageEvent):
         """生成授权链接发给用户"""
-        # 生成链接前重新加载配置，确保读取的是 WebUI 中最新保存的值
-        self._load_config_and_init()
-        
+        # 注意：这里去掉了之前冗余的 reload 步骤，因为 WebUI 保存时框架会自动重载整个插件
         if not self.auth_manager:
             yield event.plain_result("请先在 WebUI 面板中填入完整的 client_id 和 client_secret。")
             return
