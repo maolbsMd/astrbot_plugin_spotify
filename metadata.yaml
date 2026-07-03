@@ -1,6 +1,6 @@
 name: astrbot_plugin_spotify
 display_name: Spotify 智能点歌控制
-version: 1.1.0
+version: 1.2.0
 author: maolbsMd
 desc: 让 Bot 拥有 Spotify 的完整控制权！支持自然语言点歌、排队、切歌、暂停，以及将好听的音乐一键加入收藏夹。
 repo: https://github.com/maolbsMd/astrbot_plugin_spotify
