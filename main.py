@@ -303,7 +303,7 @@ class SpotifyController(Star):
         参数 search_type: 可选 "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(获取用户私人歌单库的全部列表)。
         参数 limit: 返回结果数 (1-50)。
         🤖 Bot 必读常识：
-        - 用户的「每周推荐 (Discover Weekly)」、「日推 (Daily Mix)」等官方算法歌单，通常就在 my_playlists 的列表里。你可以直接读取并找到它的 URI，然后调用 play_context 播放。
+        - 用户的「每周新发现」歌单为「37i9dQZEVXcSlO6ySd8jXF」、。你可以直ontext 播放。
         """
         if not self.sp: return "Spotify 未授权。"
         limit = max(1, min(limit, 50))
