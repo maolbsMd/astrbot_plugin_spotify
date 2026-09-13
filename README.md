@@ -137,6 +137,7 @@ Spotify API 有一个硬性规定：**只能控制当前正在活跃的设备**�
 ## 网络链路容灾
 * 使用 requests.Session 配合 urllib3 Retry，对 429、5xx 和网络抖动加入 3 次退避重试，彻底解决 RemoteDisconnected 偶发断连
 ## 设备休眠拉活兜底
+* 新增 _ensure_active_device 机制，检测到无活跃设备时自动抓取列表并执行 transfer_playback 唤醒，解决暂停几秒就报 404 NO_ACTIVE_DEVICE 的硬伤
 ## 收藏与歌单批量操作
 * manage_collection 支持英文逗号分隔批量添加，并新增 remove 动作，支持一键将曲目移出收藏或指定歌单
 * 新增 _ensure_active_device 机制，检测到无活跃设备时自动抓取列表并执行 transfer_playback 唤醒，解决暂停几秒就报 404 NO_ACTIVE_DEVICE 的硬伤
