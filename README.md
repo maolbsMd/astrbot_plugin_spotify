@@ -141,4 +141,5 @@ Spotify API 有一个硬性规定：**只能控制当前正在活跃的设备**�
 ## 收藏与歌单批量操作
 * manage_collection 支持英文逗号分隔批量添加，并新增 remove 动作，支持一键将曲目移出收藏或指定歌单
 * 新增 _ensure_active_device 机制，检测到无活跃设备时自动抓取列表并执行 transfer_playback 唤醒，解决暂停几秒就报 404 NO_ACTIVE_DEVICE 的硬伤
+---
 *Developed by maolbsMd | 开源让生活更美好*
