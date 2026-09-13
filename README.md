@@ -131,4 +131,13 @@ Spotify API 有一个硬性规定：**只能控制当前正在活跃的设备**�
 ### ♻️ 架构优化 (Refactor)
 * **🎛️ 统一播放控制中枢 (`manage_playback`)**：将以往零碎的播放、暂停、切歌、快进/回退、音量调节、模式切换等功能，完美合并为一个统一的航母级 Tool。极大地降低了大模型调用工具时的“认知负担”，显著减少 Token 消耗与接口响应延迟。
 ---
+# v1.3.0: 健硕的播放助手
+## 移除失效接口与性能优化
+* **把Spotify更新后不开放的接口删除，减少延迟。
+## 网络链路容灾
+* **使用 requests.Session 配合 urllib3 Retry，对 429、5xx 和网络抖动加入 3 次退避重试，彻底解决 RemoteDisconnected 偶发断连
+## 设备休眠拉活兜底
+## 收藏与歌单批量操作
+* **manage_collection 支持英文逗号分隔批量添加，并新增 remove 动作，支持一键将曲目移出收藏或指定歌单
+* **新增 _ensure_active_device 机制，检测到无活跃设备时自动抓取列表并执行 transfer_playback 唤醒，解决暂停几秒就报 404 NO_ACTIVE_DEVICE 的硬伤
 *Developed by maolbsMd | 开源让生活更美好*
