@@ -1,17 +1,22 @@
 import os
 import json
 import re
+import time
+import requests
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from astrbot.api.all import *
 from astrbot.api.event import filter
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.2.1")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.3.0")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.sp = None
         self.auth_manager = None
+        self.last_active_device_id = None
         
         if config:
             self.config = config
@@ -26,11 +31,38 @@ class SpotifyController(Star):
         # 初始化 Spotify
         self._init_spotify()
 
+    def _get_retry_session(self) -> requests.Session:
+        """构建具备自动重试机制的 Session，避免网络抖动导致直接断连"""
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
     def _init_spotify(self):
-        """真正的配置加载逻辑，不再去读死文件，而是读内存里的 config 字典"""
+        """真正的配置加载逻辑，优先从 config.json 读，避免空配置问题"""
         client_id = self.config.get("client_id", "").strip()
         client_secret = self.config.get("client_secret", "").strip()
         redirect_uri = self.config.get("redirect_uri", "http://127.0.0.1:6198/callback").strip()
+        
+        # 兼容外层数据目录的配置文件
+        if not client_id or client_id in ["你的_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID"]:
+            ext_cfg_path = os.path.join(os.path.abspath(os.sep), "AstrBot", "data", "config", "astrbot_plugin_spotify_config.json")
+            if os.path.exists(ext_cfg_path):
+                try:
+                    with open(ext_cfg_path, "r", encoding="utf-8-sig") as f:
+                        ext_cfg = json.load(f)
+                        client_id = ext_cfg.get("client_id", "").strip()
+                        client_secret = ext_cfg.get("client_secret", "").strip()
+                        redirect_uri = ext_cfg.get("redirect_uri", redirect_uri).strip()
+                except Exception:
+                    pass
         
         # 清理用户从 WebUI 复制时可能带入的 Markdown 乱码
         if "[" in redirect_uri or "]" in redirect_uri:
@@ -39,23 +71,63 @@ class SpotifyController(Star):
                 redirect_uri = match.group(0)
         
         # 检查是否还是占位符
-        if not client_id or not client_secret or client_id == "你的_CLIENT_ID" or client_id == "YOUR_SPOTIFY_CLIENT_ID":
+        if not client_id or not client_secret or client_id in ["你的_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID"]:
             return
             
-        scope = "user-modify-playback-state user-read-playback-state user-library-modify"
+        scope = "user-modify-playback-state user-read-playback-state user-read-currently-playing user-read-recently-played user-library-modify user-library-read playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private"
+        session = self._get_retry_session()
+        cache_path = os.path.join(os.path.abspath(os.sep), "AstrBot", ".cache")
+        if not os.path.exists(cache_path):
+            cache_path = ".cache"
+            
         self.auth_manager = SpotifyOAuth(
             client_id=client_id,
             client_secret=client_secret,
             redirect_uri=redirect_uri,
             scope=scope,
-            open_browser=False 
+            open_browser=False,
+            requests_session=session,
+            cache_path=cache_path
         )
         
         token_info = self.auth_manager.validate_token(self.auth_manager.cache_handler.get_cached_token())
         if token_info:
-            self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+            self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
         else:
             self.sp = None
+
+    def _ensure_active_device(self) -> bool:
+        """检测并尝试唤醒休眠设备，避免因设备离线导致 404 NO_ACTIVE_DEVICE"""
+        if not self.sp:
+            return False
+        try:
+            playback = self.sp.current_playback()
+            if playback and playback.get('device', {}).get('is_active'):
+                self.last_active_device_id = playback.get('device', {}).get('id')
+                return True
+
+            devices_res = self.sp.devices()
+            devices = devices_res.get('devices', [])
+            if not devices:
+                return False
+
+            target_id = None
+            if self.last_active_device_id:
+                for d in devices:
+                    if d.get('id') == self.last_active_device_id:
+                        target_id = self.last_active_device_id
+                        break
+            if not target_id and devices:
+                target_id = devices[0].get('id')
+
+            if target_id:
+                self.sp.transfer_playback(device_id=target_id, force_play=True)
+                self.last_active_device_id = target_id
+                time.sleep(0.5)
+                return True
+            return False
+        except Exception:
+            return False
 
     # ================= 供人类用户使用的授权指令 =================
 
@@ -87,33 +159,30 @@ class SpotifyController(Star):
             return
             
         try:
-            # 从用户发来的 URL 中提取 code
             code = self.auth_manager.parse_response_code(url)
             if not code:
                 yield event.plain_result("授权失败：提取不到 code，请确保复制了完整的链接。")
                 return
                 
-            # 用 code 换取真实的 Token
             self.auth_manager.get_access_token(code)
-            
-            # 重新初始化 Spotify 客户端
-            self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+            session = self._get_retry_session()
+            self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
             yield event.plain_result("✅ 授权成功！你的 Spotify 已经与 Bot 连接，现在可以开始点歌了！")
             
         except Exception as e:
             yield event.plain_result(f"❌ 授权过程中出错：{str(e)}")
 
-# ================= Bot 被动使用的 LLM Tools =================
+# ================= 状态提取与视野 =================
 
-    def _get_passive_status(self) -> str:
-        """内部辅助函数：获取状态、队列、模式、来源以及当前歌曲的硬核音频细节，作为被动视野"""
+    def _get_playback_info(self) -> dict:
+        """获取当前播放器详细字典"""
         if not self.sp:
-            return ""
+            return {"status": "Spotify 未授权"}
         try:
             res = self.sp.current_playback()
             if not res:
-                return "\n\n[👁️ 被动视野: 当前无活跃设备，或设备处于休眠状态]"
-            
+                return {"status": "无活跃设备或设备休眠"}
+                
             def ms_to_time(ms):
                 if not ms: return "0:00"
                 return f"{ms//60000}:{((ms//1000)%60):02d}"
@@ -124,24 +193,17 @@ class SpotifyController(Star):
                 artists = ", ".join([a.get('name', '未知') for a in track.get('artists', [])])
                 dur = ms_to_time(track.get('duration_ms', 0))
                 return f"{name} - {artists} ({dur})"
-            
-            # 1. 基础设备与播放状态
-            vol = res.get('device', {}).get('volume_percent', '未知')
-            is_playing = "▶️ 播放中" if res.get('is_playing') else "⏸️ 已暂停"
-            
-            # 2. 播放模式
-            shuffle_str = "开启" if res.get('shuffle_state') else "关闭"
-            repeat_dict = {"off": "关闭", "track": "单曲", "context": "列表"}
-            repeat_str = repeat_dict.get(res.get('repeat_state', 'off'), "未知")
-            
-            # 3. 🔥 获取播放来源 (Context) 并极速反查名称
+                
+            dev = res.get('device', {})
+            if dev.get('id'):
+                self.last_active_device_id = dev.get('id')
+                
             context_obj = res.get('context')
             context_str = "单曲或搜索"
             if context_obj:
                 c_type = context_obj.get('type')
                 c_uri = context_obj.get('uri')
                 type_zh = {"playlist": "歌单", "album": "专辑", "artist": "歌手电台"}.get(c_type, c_type)
-                
                 try:
                     c_name = "未知名称"
                     if c_type == 'playlist':
@@ -153,118 +215,135 @@ class SpotifyController(Star):
                     context_str = f"{type_zh}「{c_name}」"
                 except Exception:
                     context_str = f"{type_zh}"
-            
-            # 整合状态栏
-            status_str = f"状态={is_playing} | 音量={vol}% | 来源={context_str} | 模式=(随机:{shuffle_str}/循环:{repeat_str})"
+
+            shuffle_str = "开启" if res.get('shuffle_state') else "关闭"
+            repeat_dict = {"off": "关闭", "track": "单曲", "context": "列表"}
+            repeat_str = repeat_dict.get(res.get('repeat_state', 'off'), "未知")
             
             item = res.get('item')
-            details_str = ""
-            if item:
-                prog = res.get('progress_ms', 0)
-                status_str += f"\n  当前={format_track(item)} | 进度={ms_to_time(prog)}/{ms_to_time(item.get('duration_ms', 0))}"
-                
-                # 获取特征 (跳过可能被封杀的音频特征 API 报错)
-                try:
-                    track_id = item.get('id')
-                    if track_id:
-                        features_list = self.sp.audio_features([track_id])
-                        if features_list and features_list[0]:
-                            features = features_list[0]
-                            bpm = round(features.get('tempo', 0))
-                            key_idx = features.get('key', -1)
-                            mode_val = features.get('mode', 1)
-                            key_map = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-                            key_str = f"{key_map[key_idx]}{'m' if mode_val == 0 else ''}" if 0 <= key_idx < 12 else "未知"
-                            valence = int(features.get('valence', 0) * 100)
-                            energy = int(features.get('energy', 0) * 100)
-                            dance = int(features.get('danceability', 0) * 100)
-                            details_str = f"\n  特征=[BPM:{bpm} | 调式:{key_str} | 情绪:{valence}% | 能量:{energy}% | 舞动:{dance}%]"
-                except Exception:
-                    pass
+            track_str = format_track(item) if item else "无"
+            prog_str = f"{ms_to_time(res.get('progress_ms', 0))}/{ms_to_time(item.get('duration_ms', 0))}" if item else "0:00/0:00"
             
-            # 4. 获取队列信息 (上下5条)
-            history_str, upcoming_str = "无", "无"
+            # 队列
+            upcoming_str = "无"
             try:
                 queue_data = self.sp.queue()
                 upcoming = queue_data.get('queue', [])[:5]
                 if upcoming:
                     upcoming_str = " ; ".join([format_track(t) for t in upcoming if t])
-                
-                recent_data = self.sp.current_user_recently_played(limit=5)
-                recent = recent_data.get('items', [])
-                if recent:
-                    history_list = [format_track(i.get('track')) for i in recent if i.get('track')]
-                    history_list.reverse()
-                    history_str = " ; ".join(history_list)
             except Exception:
                 pass
-                
-            return f"\n\n[👁️ 被动视野: {status_str}{details_str}]\n[🎵 队列: (已播) {history_str} ==> (当前) ==> (即将) {upcoming_str}]"
+
+            return {
+                "status": "▶️ 播放中" if res.get('is_playing') else "⏸️ 已暂停",
+                "device": dev.get('name', '默认设备'),
+                "volume": f"{dev.get('volume_percent', '未知')}%",
+                "context": context_str,
+                "shuffle": shuffle_str,
+                "repeat": repeat_str,
+                "track": track_str,
+                "progress": prog_str,
+                "upcoming": upcoming_str
+            }
+        except Exception as e:
+            return {"status": f"获取失败: {str(e)}"}
+
+    def _get_passive_status(self) -> str:
+        """内部辅助函数：作为被动视野拼接到各工具返回值"""
+        info = self._get_playback_info()
+        if "track" not in info:
+            return f"\n\n[👁️ 被动视野: {info.get('status', '无活跃设备')}]"
             
-        except Exception:
-            return ""
+        status_line = f"状态={info['status']} | 设备={info['device']} | 音量={info['volume']} | 来源={info['context']} | 模式=(随机:{info['shuffle']}/循环:{info['repeat']})"
+        curr_line = f"  当前={info['track']} | 进度={info['progress']}"
+        queue_line = f"[🎵 队列: (当前) ==> (即将) {info['upcoming']}]"
+        return f"\n\n[👁️ 被动视野: {status_line}\n{curr_line}]\n{queue_line}"
 
 # ================= Bot 自主调用的 LLM Tools =================
+
+    @llm_tool(name="check_current_playback")
+    async def check_current_playback(self, event: AstrMessageEvent) -> str:
+        """
+        主动查看当前 Spotify 播放状态与曲目信息（主动视野）。
+        当用户询问“在播什么”、“当前歌曲”、“spotify状态”或 Bot 想要主动确认播放进度时调用。
+        """
+        if not self.sp:
+            return "Spotify 未授权。"
+        info = self._get_playback_info()
+        if "track" not in info:
+            return f"当前状态：{info.get('status', '无活跃设备或休眠中')}。"
+            
+        return (
+            f"🎵 当前播放状态：\n"
+            f"- 状态：{info['status']} (设备: {info['device']}, 音量: {info['volume']})\n"
+            f"- 歌曲：{info['track']}\n"
+            f"- 进度：{info['progress']}\n"
+            f"- 来源：{info['context']}\n"
+            f"- 模式：随机 {info['shuffle']} / 循环 {info['repeat']}\n"
+            f"- 即将播放：{info['upcoming']}"
+        )
 
     @llm_tool(name="manage_playback")
     async def manage_playback(self, event: AstrMessageEvent, action: str, uri: str = "", value: int = -1, state: str = "") -> str:
         """
-        Spotify 核心控制中樞。
-        參數 action:
-            - "resume": 繼續播放（解除暫停）。
-            - "pause": 暫停。
-            - "queue": 排隊。將搜到的單曲 uri 加入當前播放隊尾（普通點歌首選）。
-            - "play_context": 播放整個歌單或專輯。必須提供目標的 uri。用來播放每週推薦、個人歌單或特定專輯。
+        Spotify 核心控制中枢。
+        参数 action:
+            - "resume": 继续播放（若设备休眠会自动尝试唤醒拉活）。
+            - "pause": 暂停。
+            - "queue": 排队。将搜到的单曲 uri 加入当前播放队尾。
+            - "play_context": 播放整个歌单或专辑。必须提供目标的 uri。
             - "next": 下一首。
             - "previous": 上一首。
-            - "seek": 調整進度 (需提供 value 毫秒)。
-            - "volume": 調節音量 (需提供 value 0-100)。
-            - "shuffle" / "repeat": 模式切換 (需提供 state)。
+            - "seek": 调整进度 (需提供 value 毫秒)。
+            - "volume": 调节音量 (需提供 value 0-100)。
+            - "shuffle" / "repeat": 模式切换 (需提供 state)。
         """
-        if not self.sp: return "Spotify 未授權。" + self._get_passive_status()
+        if not self.sp: return "Spotify 未授权。" + self._get_passive_status()
             
         try:
             result_msg = ""
+            if action in ["resume", "play_context", "next", "previous"]:
+                self._ensure_active_device()
+
             if action == "resume":
                 self.sp.start_playback()
-                result_msg = "已恢復播放。"
+                result_msg = "已恢复播放。"
             elif action == "pause":
                 self.sp.pause_playback()
-                result_msg = "音樂已暫停。"
+                result_msg = "音乐已暂停。"
             elif action == "queue":
-                if not uri: return "排隊失敗：缺少 URI。"
+                if not uri: return "排队失败：缺少 URI。"
                 self.sp.add_to_queue(uri)
-                result_msg = "✅ 已成功將音樂加入隊尾。"
+                result_msg = "✅ 已成功将音乐加入队尾。"
             elif action == "play_context":
-                if not uri: return "播放歌單失敗：缺少 URI。"
-                # 播放歌單、專輯、歌手電台等上下文必須使用 context_uri 參數
+                if not uri: return "播放歌单失败：缺少 URI。"
                 self.sp.start_playback(context_uri=uri)
-                result_msg = "🎵 已成功切入全新的歌單/專輯上下文開始播放！"
+                result_msg = "🎵 已成功切入全新的歌单/专辑上下文开始播放！"
             elif action == "next":
                 self.sp.next_track()
-                result_msg = "已切換到下一首。"
+                result_msg = "已切换到下一首。"
             elif action == "previous":
                 self.sp.previous_track()
-                result_msg = "已切換到上一首。"
+                result_msg = "已切换到上一首。"
             elif action == "seek":
                 self.sp.seek_track(value)
-                result_msg = f"已調整進度至 {value//1000} 秒。"
+                result_msg = f"已调整进度至 {value//1000} 秒。"
             elif action == "volume":
                 self.sp.volume(value)
-                result_msg = f"音量已調至 {value}%。"
+                result_msg = f"音量已调至 {value}%。"
             elif action == "shuffle":
                 self.sp.shuffle(state.lower() == "true")
-                result_msg = f"隨機播放已{'開啟' if state.lower() == 'true' else '關閉'}。"
+                result_msg = f"随机播放已{'开启' if state.lower() == 'true' else '关闭'}。"
             elif action == "repeat":
                 self.sp.repeat(state)
-                result_msg = f"循環模式已設置為: {state}。"
+                result_msg = f"循环模式已设置为: {state}。"
             else:
                 result_msg = f"未知的指令：{action}"
                 
             return result_msg + self._get_passive_status()
             
         except Exception as e:
-            return f"操作失敗：{str(e)}" + self._get_passive_status()
+            return f"操作失败：{str(e)}" + self._get_passive_status()
 
     @llm_tool(name="quick_order_song")
     async def quick_order_song(self, event: AstrMessageEvent, keyword: str, action: str = "queue") -> str:
@@ -272,8 +351,8 @@ class SpotifyController(Star):
         极速点歌通道（一步完成搜索与播放）。
         参数 keyword: 歌曲或歌手名。
         参数 action:
-            - "queue" (默认): 安全加入队尾，不打断当前播放。
-            - "play": ⚠️立即打断！清空当前全部播放队列，仅独占播放这一首！只在用户明确要求“立刻/马上切歌”时使用。
+            - "queue" (默认): 安全加入队尾，绝对不打断当前歌单上下文。
+            - "play": 插播到下一首并立刻切过去，保留当前歌单播放队列！只有用户明确说“立刻/马上听”时使用。
         """
         if not self.sp: return "Spotify 未授权。" + self._get_passive_status()
             
@@ -286,8 +365,13 @@ class SpotifyController(Star):
             uri, name, artist = track['uri'], track['name'], track['artists'][0]['name']
             
             if action == "play":
-                self.sp.start_playback(uris=[uri])
-                return f"⚠️ 已清空原队列并立即插播: {name} - {artist}" + self._get_passive_status()
+                self._ensure_active_device()
+                # 优化：不直接 start_playback(uris=[uri]) 打烂上下文
+                # 而是加入队列后立即 next_track 切过去，保护当前歌单上下文不丢失
+                self.sp.add_to_queue(uri)
+                time.sleep(0.3)
+                self.sp.next_track()
+                return f"⚡ 已将歌曲加入队列并立即切至该首（保护原歌单上下文）：{name} - {artist}" + self._get_passive_status()
             else:
                 self.sp.add_to_queue(uri)
                 return f"✅ 已成功加入队尾: {name} - {artist}" + self._get_passive_status()
@@ -302,8 +386,6 @@ class SpotifyController(Star):
         参数 keyword: 搜索词。若查询自己的歌单，此项可留空。
         参数 search_type: 可选 "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(获取用户私人歌单库的全部列表)。
         参数 limit: 返回结果数 (1-50)。
-        🤖 Bot 必读常识：
-        - 用户的「每周新发现」歌单为「37i9dQZEVXcSlO6ySd8jXF」、。你可以直ontext 播放。
         """
         if not self.sp: return "Spotify 未授权。"
         limit = max(1, min(limit, 50))
@@ -311,10 +393,8 @@ class SpotifyController(Star):
         try:
             response_text = ""
             if search_type == "my_playlists":
-                # 拒绝走捷径：无视 limit，直接轮询抓取用户的所有歌单
                 items = []
                 results = self.sp.current_user_playlists(limit=50)
-                
                 if results and 'items' in results:
                     items.extend(results['items'])
                     while results.get('next'):
@@ -370,23 +450,34 @@ class SpotifyController(Star):
             return f"搜索失败：{str(e)}" + self._get_passive_status()
 
     @llm_tool(name="manage_collection")
-    async def manage_collection(self, event: AstrMessageEvent, track_uri: str, playlist_uri: str = "") -> str:
+    async def manage_collection(self, event: AstrMessageEvent, track_uri: str, playlist_uri: str = "", action: str = "add") -> str:
         """
-        音乐收藏与歌单归类工具。
-        参数 track_uri: 必须提供，要操作的歌曲 URI。
-        参数 playlist_uri: 可选。目标歌单的 URI。
-            - 若留空：默认将歌曲加入用户个人的“喜欢的音乐 (Liked Songs)”中。
-            - 若填写了特定歌单的 URI：则将歌曲精准加入该指定的私人歌单中。
+        音乐收藏与歌单归类/移除工具。
+        参数 track_uri: 歌曲 URI，支持多首歌曲用英文逗号分隔（如 "uri1,uri2"）。
+        参数 playlist_uri: 可选。目标歌单的 URI。留空则代表操作用户的“喜欢的音乐”。
+        参数 action: "add"(添加, 默认) 或 "remove"(移除)。
         """
         if not self.sp:
             return "Spotify 未授权。" + self._get_passive_status()
             
         try:
-            if not playlist_uri:
-                self.sp.current_user_saved_tracks_add(tracks=[track_uri])
-                return "✅ 已成功将歌曲加入用户的「喜欢的音乐」收藏夹！" + self._get_passive_status()
+            track_uris = [u.strip() for u in track_uri.split(",") if u.strip()]
+            if not track_uris:
+                return "操作失败：未提供有效的 track_uri。"
+                
+            if action == "remove":
+                if not playlist_uri:
+                    self.sp.current_user_saved_tracks_delete(tracks=track_uris)
+                    return f"✅ 已成功将 {len(track_uris)} 首歌曲从「喜欢的音乐」中移除！" + self._get_passive_status()
+                else:
+                    self.sp.playlist_remove_all_occurrences_of_items(playlist_id=playlist_uri, items=track_uris)
+                    return f"✅ 已成功将 {len(track_uris)} 首歌曲从指定歌单中移除！" + self._get_passive_status()
             else:
-                self.sp.playlist_add_items(playlist_id=playlist_uri, items=[track_uri])
-                return "✅ 已成功将歌曲加入到指定的私人歌单中！" + self._get_passive_status()
+                if not playlist_uri:
+                    self.sp.current_user_saved_tracks_add(tracks=track_uris)
+                    return f"✅ 已成功将 {len(track_uris)} 首歌曲加入「喜欢的音乐」收藏夹！" + self._get_passive_status()
+                else:
+                    self.sp.playlist_add_items(playlist_id=playlist_uri, items=track_uris)
+                    return f"✅ 已成功将 {len(track_uris)} 首歌曲加入到指定歌单中！" + self._get_passive_status()
         except Exception as e:
-            return f"收藏或添加歌单失败：{str(e)}" + self._get_passive_status()
+            return f"歌单操作失败：{str(e)}" + self._get_passive_status()
