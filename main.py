@@ -10,7 +10,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from astrbot.api.all import *
 from astrbot.api.event import filter
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.3.0")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.0")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -76,9 +76,9 @@ class SpotifyController(Star):
             
         scope = "user-modify-playback-state user-read-playback-state user-read-currently-playing user-read-recently-played user-library-modify user-library-read playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private"
         session = self._get_retry_session()
-        cache_path = os.path.join(os.path.abspath(os.sep), "AstrBot", ".cache")
-        if not os.path.exists(cache_path):
-            cache_path = ".cache"
+        cache_path = "/AstrBot/.cache"
+        if not os.path.exists("/AstrBot"):
+            cache_path = os.path.join(os.path.dirname(__file__), ".cache")
             
         self.auth_manager = SpotifyOAuth(
             client_id=client_id,
@@ -90,14 +90,24 @@ class SpotifyController(Star):
             cache_path=cache_path
         )
         
-        token_info = self.auth_manager.validate_token(self.auth_manager.cache_handler.get_cached_token())
-        if token_info:
-            self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
-        else:
-            self.sp = None
+        try:
+            token_info = self.auth_manager.validate_token(self.auth_manager.cache_handler.get_cached_token())
+            if token_info:
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
+            else:
+                self.sp = None
+        except Exception:
+            # 即使启动时网络抖动刷新失败，只要本地有 refresh_token 缓存，也先初始化 sp 实例交给后续请求自动刷新
+            cached = self.auth_manager.cache_handler.get_cached_token()
+            if cached and cached.get("refresh_token"):
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
+            else:
+                self.sp = None
 
     def _ensure_active_device(self) -> bool:
         """检测并尝试唤醒休眠设备，避免因设备离线导致 404 NO_ACTIVE_DEVICE"""
+        if not self.sp:
+            self._init_spotify()
         if not self.sp:
             return False
         try:
@@ -176,6 +186,8 @@ class SpotifyController(Star):
 
     def _get_playback_info(self) -> dict:
         """获取当前播放器详细字典"""
+        if not self.sp:
+            self._init_spotify()
         if not self.sp:
             return {"status": "Spotify 未授权"}
         try:
@@ -268,6 +280,8 @@ class SpotifyController(Star):
         当用户询问“在播什么”、“当前歌曲”、“spotify状态”或 Bot 想要主动确认播放进度时调用。
         """
         if not self.sp:
+            self._init_spotify()
+        if not self.sp:
             return "Spotify 未授权。"
         info = self._get_playback_info()
         if "track" not in info:
@@ -298,6 +312,8 @@ class SpotifyController(Star):
             - "volume": 调节音量 (需提供 value 0-100)。
             - "shuffle" / "repeat": 模式切换 (需提供 state)。
         """
+        if not self.sp:
+            self._init_spotify()
         if not self.sp: return "Spotify 未授权。" + self._get_passive_status()
             
         try:
@@ -354,6 +370,8 @@ class SpotifyController(Star):
             - "queue" (默认): 安全加入队尾，绝对不打断当前歌单上下文。
             - "play": 插播到下一首并立刻切过去，保留当前歌单播放队列！只有用户明确说“立刻/马上听”时使用。
         """
+        if not self.sp:
+            self._init_spotify()
         if not self.sp: return "Spotify 未授权。" + self._get_passive_status()
             
         try:
@@ -366,14 +384,24 @@ class SpotifyController(Star):
             
             if action == "play":
                 self._ensure_active_device()
+                dev_id = self.last_active_device_id
                 # 优化：不直接 start_playback(uris=[uri]) 打烂上下文
                 # 而是加入队列后立即 next_track 切过去，保护当前歌单上下文不丢失
-                self.sp.add_to_queue(uri)
-                time.sleep(0.3)
-                self.sp.next_track()
+                try:
+                    self.sp.add_to_queue(uri, device_id=dev_id)
+                except Exception:
+                    self.sp.add_to_queue(uri)
+                time.sleep(0.4)
+                try:
+                    self.sp.next_track(device_id=dev_id)
+                except Exception:
+                    self.sp.next_track()
                 return f"⚡ 已将歌曲加入队列并立即切至该首（保护原歌单上下文）：{name} - {artist}" + self._get_passive_status()
             else:
-                self.sp.add_to_queue(uri)
+                try:
+                    self.sp.add_to_queue(uri, device_id=self.last_active_device_id)
+                except Exception:
+                    self.sp.add_to_queue(uri)
                 return f"✅ 已成功加入队尾: {name} - {artist}" + self._get_passive_status()
                 
         except Exception as e:
@@ -387,6 +415,8 @@ class SpotifyController(Star):
         参数 search_type: 可选 "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(获取用户私人歌单库的全部列表)。
         参数 limit: 返回结果数 (1-50)。
         """
+        if not self.sp:
+            self._init_spotify()
         if not self.sp: return "Spotify 未授权。"
         limit = max(1, min(limit, 50))
             
@@ -457,6 +487,8 @@ class SpotifyController(Star):
         参数 playlist_uri: 可选。目标歌单的 URI。留空则代表操作用户的“喜欢的音乐”。
         参数 action: "add"(添加, 默认) 或 "remove"(移除)。
         """
+        if not self.sp:
+            self._init_spotify()
         if not self.sp:
             return "Spotify 未授权。" + self._get_passive_status()
             
