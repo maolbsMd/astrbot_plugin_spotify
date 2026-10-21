@@ -1,3 +1,19 @@
+# v1.4.2: 搜索校验与超时架构优化 🛡️
+
+### 🛠️ 大模型工具规范与 Schema 修复 (Tool Docs & Schema)
+* **标准 `Args:` 格式化重构**：全面重构所有 LLM Tool（`manage_playback`、`quick_order_song`、`search_spotify_library`、`manage_collection`）的文档注释，严格按照标准 Google/AstrBot 参数规范定义类型与描述。
+* **参数为空 Bug 彻底根除**：彻底解决大模型框架在解析非标准 docstring 时出现参数 Schema 丢失（生成无参工具签名）导致调用报错的硬伤。
+
+### 🔍 极速点歌精确匹配 (Smart Exact Match)
+* **内存毫秒级比对**：`quick_order_song` 搜索深度由 1 首提升至 5 首，并在本地内存直接执行同名精准比对。
+* **规避盲选与翻唱陷阱**：优先命中完全同名曲目，避免官方搜索排位首项被非目标翻唱/混音占用；零额外网络开销，无需二次交互，保持极速响应。
+
+### ⏱️ 全链路超时控制可配置 (Configurable Timeout)
+* **配置项暴露**：新增 `requests_timeout` 配置项（默认 10 秒），用户可在 WebUI 控制面板自由调整。
+* **全生命周期绑定**：从 OAuth 鉴权换 Token 到底层所有 Spotify API 网络请求全量注入超时，杜绝网络异常抖动导致的主进程无限阻塞卡死。
+
+-------------------------------------
+
 # Changelog / 更新日志
 
 ## [v1.2.0] - 2026-07-03
