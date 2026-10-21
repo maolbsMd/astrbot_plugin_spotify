@@ -82,6 +82,12 @@ class SpotifyController(Star):
         session = self._get_retry_session()
         cache_path = self._get_cache_path()
 
+        timeout_sec = self.config.get("requests_timeout", 10)
+        try:
+            timeout_sec = int(timeout_sec)
+        except Exception:
+            timeout_sec = 10
+
         self.auth_manager = SpotifyOAuth(
             client_id=client_id,
             client_secret=client_secret,
@@ -90,6 +96,7 @@ class SpotifyController(Star):
             open_browser=False,
             requests_session=session,
             cache_path=cache_path,
+            requests_timeout=timeout_sec,
         )
 
     def _init_spotify_sync(self):
@@ -105,14 +112,24 @@ class SpotifyController(Star):
                 self.auth_manager.cache_handler.get_cached_token()
             )
             if token_info:
-                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
+                timeout_sec = self.config.get("requests_timeout", 10)
+                try:
+                    timeout_sec = int(timeout_sec)
+                except Exception:
+                    timeout_sec = 10
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session, requests_timeout=timeout_sec)
             else:
                 self.sp = None
         except Exception:
             # 即使启动时网络抖动刷新失败，只要本地有 refresh_token 缓存，也先初始化 sp 实例交给后续请求自动刷新
             cached = self.auth_manager.cache_handler.get_cached_token()
             if cached and cached.get("refresh_token"):
-                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
+                timeout_sec = self.config.get("requests_timeout", 10)
+                try:
+                    timeout_sec = int(timeout_sec)
+                except Exception:
+                    timeout_sec = 10
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session, requests_timeout=timeout_sec)
             else:
                 self.sp = None
 
@@ -334,18 +351,13 @@ class SpotifyController(Star):
     async def manage_playback(
         self, event: AstrMessageEvent, action: str, uri: str = "", value: int = -1, state: str = ""
     ) -> str:
-        """
-        Spotify 核心控制中枢。
-        参数 action:
-            - "resume": 继续播放（若设备休眠会自动尝试唤醒拉活）。
-            - "pause": 暂停。
-            - "queue": 排队。将搜到的单曲 uri 加入当前播放队尾。
-            - "play_context": 播放整个歌单或专辑。必须提供目标的 uri。
-            - "next": 下一首。
-            - "previous": 上一首。
-            - "seek": 调整进度 (需提供 value 毫秒)。
-            - "volume": 调节音量 (需提供 value 0-100)。
-            - "shuffle" / "repeat": 模式切换 (需提供 state)。
+        """Spotify 核心控制中枢。
+
+        Args:
+            action(string): 控制动作。可选: "resume"(继续播放), "pause"(暂停), "queue"(排队歌曲), "play_context"(播放歌单/专辑), "next"(下一首), "previous"(上一首), "seek"(调整进度), "volume"(调音量), "shuffle"(随机播放), "repeat"(循环模式)。
+            uri(string): 歌曲、歌单或专辑的 URI。当 action 为 queue 或 play_context 时必须提供。
+            value(number): 调整进度的毫秒数(当 action="seek" 时)，或音量百分比 0-100(当 action="volume" 时)。
+            state(string): 模式切换状态。shuffle 可选 "true"/"false"；repeat 可选 "off"/"track"/"context"。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
@@ -399,29 +411,35 @@ class SpotifyController(Star):
 
     @llm_tool(name="quick_order_song")
     async def quick_order_song(self, event: AstrMessageEvent, keyword: str, action: str = "queue") -> str:
-        """
-        极速点歌通道（一步完成搜索与播放）。
-        参数 keyword: 歌曲或歌手名。
-        参数 action:
-            - "queue" (默认): 安全加入队尾，绝对不打断当前歌单上下文。
-            - "play": 插播到下一首并立刻切过去，保留当前歌单播放队列！只有用户明确说“立刻/马上听”时使用。
+        """极速点歌通道（一步完成搜索与播放）。
+
+        Args:
+            keyword(string): 歌曲名或歌手名。
+            action(string): 点歌动作。可选: "queue"(默认，安全加入队尾不打断当前播放), "play"(插播到下一首并立刻切歌)。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
 
         try:
-            results = await asyncio.to_thread(self.sp.search, q=keyword, limit=1, type="track")
-            if not results or not results.get("tracks", {}).get("items"):
+            results = await asyncio.to_thread(self.sp.search, q=keyword, limit=5, type="track")
+            items = results.get("tracks", {}).get("items", []) if results else []
+            if not items:
                 return f"未搜到 '{keyword}' 的歌曲。" + await self._get_passive_status()
 
-            track = results["tracks"]["items"][0]
-            uri, name, artist = track["uri"], track["name"], track["artists"][0]["name"]
+            # 内存秒比对：优先找完全同名歌曲，无精确匹配则取搜索排位第一项
+            target_track = items[0]
+            clean_kw = keyword.strip().lower()
+            for t in items:
+                if t.get("name", "").strip().lower() == clean_kw:
+                    target_track = t
+                    break
+
+            uri, name, artist = target_track["uri"], target_track["name"], target_track["artists"][0]["name"]
 
             if action == "play":
                 await self._ensure_active_device()
                 dev_id = self.last_active_device_id
-                # 优化：不直接 start_playback(uris=[uri]) 打烂上下文
-                # 而是加入队列后立即 next_track 切过去，保护当前歌单上下文不丢失
+                # 优化：加入队列后切歌，保护当前歌单上下文不丢失
                 try:
                     await asyncio.to_thread(self.sp.add_to_queue, uri, device_id=dev_id)
                 except Exception:
@@ -463,11 +481,12 @@ class SpotifyController(Star):
     async def search_spotify_library(
         self, event: AstrMessageEvent, keyword: str = "", search_type: str = "track", limit: int = 5
     ) -> str:
-        """
-        Spotify 搜索与私人歌单探测器。
-        参数 keyword: 搜索词。若查询自己的歌单，此项可留空。
-        参数 search_type: 可选 "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(获取用户私人歌单库的全部列表)。
-        参数 limit: 返回结果数 (1-50)。
+        """Spotify 搜索与私人歌单探测器。
+
+        Args:
+            keyword(string): 搜索关键词。若查询自己的歌单(my_playlists)，此项可留空。
+            search_type(string): 搜索类型。可选: "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(用户私人歌单全量列表)。
+            limit(number): 返回结果数量上限，范围 1-50，默认 5。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。"
@@ -553,11 +572,12 @@ class SpotifyController(Star):
     async def manage_collection(
         self, event: AstrMessageEvent, track_uri: str, playlist_uri: str = "", action: str = "add"
     ) -> str:
-        """
-        音乐收藏与歌单归类/移除工具。
-        参数 track_uri: 歌曲 URI，支持多首歌曲用英文逗号分隔（如 "uri1,uri2"）。
-        参数 playlist_uri: 可选。目标歌单的 URI。留空则代表操作用户的“喜欢的音乐”。
-        参数 action: "add"(添加, 默认) 或 "remove"(移除)。
+        """音乐收藏与歌单归类/移除工具。
+
+        Args:
+            track_uri(string): 歌曲 URI，支持多首歌曲用英文逗号分隔（如 "uri1,uri2"）。
+            playlist_uri(string): 目标歌单的 URI。留空则代表操作用户的“喜欢的音乐”。
+            action(string): 操作动作。可选: "add"(添加收藏，默认), "remove"(移除收藏)。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
