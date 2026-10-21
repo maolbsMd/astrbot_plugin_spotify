@@ -13,7 +13,7 @@ from astrbot.api.event import filter
 from astrbot.api.star import StarTools
 
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.1")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.3")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -47,6 +47,14 @@ class SpotifyController(Star):
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
+
+    def _get_requests_timeout(self) -> int:
+        """Return a positive timeout in seconds, falling back to the default."""
+        try:
+            timeout = int(self.config.get("requests_timeout", 10))
+            return timeout if timeout > 0 else 10
+        except (TypeError, ValueError):
+            return 10
 
     def _get_cache_path(self) -> str:
         """获取符合 AstrBot 规范的数据持久化路径 data/plugin_data/astrbot_plugin_spotify/.cache"""
@@ -82,11 +90,7 @@ class SpotifyController(Star):
         session = self._get_retry_session()
         cache_path = self._get_cache_path()
 
-        timeout_sec = self.config.get("requests_timeout", 10)
-        try:
-            timeout_sec = int(timeout_sec)
-        except Exception:
-            timeout_sec = 10
+        timeout_sec = self._get_requests_timeout()
 
         self.auth_manager = SpotifyOAuth(
             client_id=client_id,
@@ -112,11 +116,7 @@ class SpotifyController(Star):
                 self.auth_manager.cache_handler.get_cached_token()
             )
             if token_info:
-                timeout_sec = self.config.get("requests_timeout", 10)
-                try:
-                    timeout_sec = int(timeout_sec)
-                except Exception:
-                    timeout_sec = 10
+                timeout_sec = self._get_requests_timeout()
                 self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session, requests_timeout=timeout_sec)
             else:
                 self.sp = None
@@ -124,11 +124,7 @@ class SpotifyController(Star):
             # 即使启动时网络抖动刷新失败，只要本地有 refresh_token 缓存，也先初始化 sp 实例交给后续请求自动刷新
             cached = self.auth_manager.cache_handler.get_cached_token()
             if cached and cached.get("refresh_token"):
-                timeout_sec = self.config.get("requests_timeout", 10)
-                try:
-                    timeout_sec = int(timeout_sec)
-                except Exception:
-                    timeout_sec = 10
+                timeout_sec = self._get_requests_timeout()
                 self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session, requests_timeout=timeout_sec)
             else:
                 self.sp = None
@@ -215,7 +211,11 @@ class SpotifyController(Star):
 
             await asyncio.to_thread(self.auth_manager.get_access_token, code)
             session = self._get_retry_session()
-            self.sp = spotipy.Spotify(auth_manager=self.auth_manager, requests_session=session)
+            self.sp = spotipy.Spotify(
+                auth_manager=self.auth_manager,
+                requests_session=session,
+                requests_timeout=self._get_requests_timeout(),
+            )
             yield event.plain_result("✅ 授权成功！你的 Spotify 已经与 Bot 连接，现在可以开始点歌了！")
 
         except Exception as e:
@@ -357,15 +357,31 @@ class SpotifyController(Star):
             action(string): 控制动作。可选: "resume"(继续播放), "pause"(暂停), "queue"(排队歌曲), "play_context"(播放歌单/专辑), "next"(下一首), "previous"(上一首), "seek"(调整进度), "volume"(调音量), "shuffle"(随机播放), "repeat"(循环模式)。
             uri(string): 歌曲、歌单或专辑的 URI。当 action 为 queue 或 play_context 时必须提供。
             value(number): 调整进度的毫秒数(当 action="seek" 时)，或音量百分比 0-100(当 action="volume" 时)。
-            state(string): 模式切换状态。shuffle 可选 "true"/"false"；repeat 可选 "off"/"track"/"context"。
+            state(string): 模式切换状态。shuffle 可选 "true"/"false"；repeat 可选 "off"/"track"/"context"。seek 的 value 必须非负；volume 的 value 范围为 0-100。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
 
         try:
+            valid_actions = {
+                "resume", "pause", "queue", "play_context", "next", "previous",
+                "seek", "volume", "shuffle", "repeat",
+            }
+            if action not in valid_actions:
+                return f"未知的指令：{action}"
+            if action in {"seek", "volume"} and value < 0:
+                return "操作失败：value 必须是非负数。"
+            if action == "volume" and value > 100:
+                return "操作失败：音量范围必须是 0-100。"
+            if action == "repeat" and state not in {"off", "track", "context"}:
+                return "操作失败：repeat 状态必须是 off、track 或 context。"
+            if action == "shuffle" and state.lower() not in {"true", "false"}:
+                return "操作失败：shuffle 状态必须是 true 或 false。"
+
             result_msg = ""
             if action in ["resume", "play_context", "next", "previous"]:
-                await self._ensure_active_device()
+                if not await self._ensure_active_device():
+                    return "操作失败：没有可用的 Spotify 播放设备。"
 
             if action == "resume":
                 await asyncio.to_thread(self.sp.start_playback)
@@ -401,8 +417,6 @@ class SpotifyController(Star):
             elif action == "repeat":
                 await asyncio.to_thread(self.sp.repeat, state)
                 result_msg = f"循环模式已设置为: {state}。"
-            else:
-                result_msg = f"未知的指令：{action}"
 
             return result_msg + await self._get_passive_status()
 
@@ -420,9 +434,14 @@ class SpotifyController(Star):
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
 
+        if action not in {"queue", "play"}:
+            return "点歌失败：action 只能是 queue 或 play。"
+
         try:
             results = await asyncio.to_thread(self.sp.search, q=keyword, limit=5, type="track")
-            items = results.get("tracks", {}).get("items", []) if results else []
+            tracks = results.get("tracks") if isinstance(results, dict) else None
+            items = tracks.get("items", []) if isinstance(tracks, dict) else []
+            items = [item for item in items if isinstance(item, dict) and item.get("uri") and item.get("name")]
             if not items:
                 return f"未搜到 '{keyword}' 的歌曲。" + await self._get_passive_status()
 
@@ -430,27 +449,32 @@ class SpotifyController(Star):
             target_track = items[0]
             clean_kw = keyword.strip().lower()
             for t in items:
-                if t.get("name", "").strip().lower() == clean_kw:
+                if t.get("name", "").strip().casefold() == clean_kw.casefold():
                     target_track = t
                     break
 
-            uri, name, artist = target_track["uri"], target_track["name"], target_track["artists"][0]["name"]
+            artists = target_track.get("artists") or []
+            artist = artists[0].get("name", "未知歌手") if artists and isinstance(artists[0], dict) else "未知歌手"
+            uri, name = target_track["uri"], target_track["name"]
 
             if action == "play":
-                await self._ensure_active_device()
+                if not await self._ensure_active_device():
+                    return "点歌失败：没有可用的 Spotify 播放设备，未修改队列。" + await self._get_passive_status()
                 dev_id = self.last_active_device_id
-                # 优化：加入队列后切歌，保护当前歌单上下文不丢失
-                try:
-                    await asyncio.to_thread(self.sp.add_to_queue, uri, device_id=dev_id)
-                except Exception:
-                    await asyncio.to_thread(self.sp.add_to_queue, uri)
+                queue_data = await asyncio.to_thread(self.sp.queue)
+                existing_queue = queue_data.get("queue", []) if isinstance(queue_data, dict) else []
+                if existing_queue:
+                    return "无法立即插播：Spotify 当前已有待播队列，API 无法安全把歌曲移到队首；队列未修改，请先清空待播队列或选择 queue。" + await self._get_passive_status()
+
+                await asyncio.to_thread(self.sp.add_to_queue, uri, device_id=dev_id)
                 await asyncio.sleep(0.4)
-                try:
-                    await asyncio.to_thread(self.sp.next_track, device_id=dev_id)
-                except Exception:
-                    await asyncio.to_thread(self.sp.next_track)
+                await asyncio.to_thread(self.sp.next_track, device_id=dev_id)
+                playback = await asyncio.to_thread(self.sp.current_playback)
+                current = playback.get("item") if isinstance(playback, dict) else None
+                if not isinstance(current, dict) or current.get("uri") != uri:
+                    return f"已发送切歌请求，但无法确认目标歌曲正在播放：{name} - {artist}。" + await self._get_passive_status()
                 return (
-                    f"⚡ 已将歌曲加入队列并立即切至该首（保护原歌单上下文）：{name} - {artist}"
+                    f"⚡ 已确认开始播放：{name} - {artist}"
                     + await self._get_passive_status()
                 )
             else:
@@ -469,12 +493,14 @@ class SpotifyController(Star):
         """在工作线程中同步拉取用户全部私人歌单"""
         items = []
         results = self.sp.current_user_playlists(limit=50)
-        if results and "items" in results:
+        if isinstance(results, dict) and "items" in results:
             items.extend(results["items"])
             while results.get("next"):
                 results = self.sp.next(results)
-                if results and "items" in results:
+                if isinstance(results, dict) and "items" in results:
                     items.extend(results["items"])
+                elif not results:
+                    break
         return items
 
     @llm_tool(name="search_spotify_library")
