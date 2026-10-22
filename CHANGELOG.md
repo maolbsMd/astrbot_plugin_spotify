@@ -1,3 +1,32 @@
+# v1.4.5: 权限分级、设备选择与暂停恢复
+
+### 权限（仅对 QQ 生效）
+* 新增「账号权限」总开关 `enable_account_permission`：关闭后所有平台、所有用户可用。
+* 新增一级权限 `enable_tier1_permission` + `admin_accounts`：关闭时人人一级，开启时仅名单内一级。
+* 新增二级权限 `enable_tier2_permission` + `tier2_accounts`：关闭时除管理员外人人二级，开启时仅名单内二级。
+* 二级权限仅能搜索单曲、排队点歌；非 QQ 平台（网页、Telegram 等）不套用名单。
+* 兼容旧键 `owner_accounts` / `user_accounts` / `allowed_accounts`。
+
+### 设备选择
+* 新增可选参数 `device`（电脑 / 手机 / 音箱 / 电视，或设备名）；未指定时不猜测设备。
+* 多设备且无活跃设备时返回设备清单交由用户确认；只有单设备时自动选中。
+* 删除“优先电脑设备”的默认行为；`allow_device_fallback` 默认关闭。
+* `check_current_playback` 现在同时列出全部可用设备。
+
+### 播放修复
+* 修复暂停状态下点歌失败：先发送不带 body 的 resume，确认 `is_playing` 后再入队 / 切歌。
+* 不再向暂停中的客户端发送 `start_playback(uris=...)`，避免清空当前曲目并锁死会话。
+* 切歌只执行一次，避免连续重试跳过队列里其他人点的歌。
+* 多人同时点歌不再被全局锁和 0.3 秒防抖拒绝。
+
+### 稳定性与可运维性
+* 统一错误码 `SP-01`…`SP-99`，保留最后一次 API 异常；日志输出完整堆栈。
+* 复用 `requests.Session`；设备探测缓存 8 秒；被动视野缓存 2 秒。
+* 搜索结果不再转义中文（`ensure_ascii=False`）。
+* 区域搜索无结果时自动回退全球搜索。
+* Windows 兼容：`fcntl` / `O_NOFOLLOW` / `fchmod` 全部按平台降级。
+* 依赖改为 `spotipy>=2.24,<3`。
+
 # v1.4.4: 极速点歌播放逻辑回归与体验优化
 
 ### 极速点歌播放逻辑回归

@@ -1,1 +1,1 @@
-spotipy
+spotipy>=2.24,<3

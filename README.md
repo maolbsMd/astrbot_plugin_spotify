@@ -142,4 +142,30 @@ Spotify API 有一个硬性规定：**只能控制当前正在活跃的设备**�
 * manage_collection 支持英文逗号分隔批量添加，并新增 remove 动作，支持一键将曲目移出收藏或指定歌单
 * 新增 _ensure_active_device 机制，检测到无活跃设备时自动抓取列表并执行 transfer_playback 唤醒，解决暂停几秒就报 404 NO_ACTIVE_DEVICE 的硬伤
 ---
+## 🆕 v1.4.5 新增：权限分级与设备选择
+
+### 账号权限（仅对 QQ 生效）
+
+| 配置 | 说明 |
+| --- | --- |
+| `enable_account_permission` | 总开关。关闭 = 所有平台所有人可用；开启 = 只有 QQ 核对名单，网页/Telegram 等直接按一级放行 |
+| `enable_tier1_permission` | 一级权限（管理员）。关闭 = 所有人一级；开启 = 只有 `admin_accounts` 一级 |
+| `enable_tier2_permission` | 二级权限（普通用户）。关闭 = 除管理员外人人二级；开启 = 只有 `tier2_accounts` 二级 |
+| `admin_accounts` | 一级名单（QQ 号），拥有全部控制权限 |
+| `tier2_accounts` | 二级名单（QQ 号），仅能搜索单曲、排队点歌 |
+
+旧配置键 `owner_accounts` / `user_accounts` / `allowed_accounts` 仍然兼容读取。
+
+### 设备选择
+
+* 工具新增可选参数 `device`，可传“电脑”“手机”“音箱”“电视”或具体设备名；
+* 不指定时：当前活跃设备 → 上次设备 → 唯一设备；多设备且无活跃设备时**不猜测**，返回设备清单让用户确认；
+* `preferred_device_id` 可固定首选设备；`allow_device_fallback` 默认关闭（找不到已知设备时不强行切到第一台）；
+* 发送“我有哪些设备”时，`check_current_playback` 会列出全部设备及活跃状态。
+
+### 播放行为
+
+* 暂停状态下点歌：先恢复播放（resume），再入队/切歌；因此切到别的歌时会先响一下当前曲目；
+* `action="play"` 在空闲或暂停时会替换当前播放上下文（队列清空），只想排队请用 `action="queue"`。
+
 *Developed by maolbsMd | 开源让生活更美好*

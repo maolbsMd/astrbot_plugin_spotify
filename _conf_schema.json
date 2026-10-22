@@ -19,42 +19,83 @@
         "type": "int",
         "default": 10
     },
-    "enable_user_whitelist": {
-        "description": "启用账号权限分级：关闭后所有可使用插件的用户都拥有完整权限。",
+    "enable_account_permission": {
+        "description": "启用账号权限（仅对 QQ 生效）。关闭后所有平台、所有用户都可以使用。",
         "type": "bool",
         "default": true
     },
-    "enable_regular_users": {
-        "description": "允许普通用户使用点歌权限：仅可搜索单曲并排队点歌。",
+    "enable_tier1_permission": {
+        "description": "启用一级权限（管理员）。关闭后所有用户都拥有一级权限；开启后只有管理员名单拥有一级权限。",
         "type": "bool",
         "default": true,
-        "condition": {"enable_user_whitelist": true}
+        "condition": {
+            "enable_account_permission": true
+        }
+    },
+    "enable_tier2_permission": {
+        "description": "启用二级权限（普通用户）。关闭后除管理员外所有人都拥有二级权限；开启后只有二级名单拥有二级权限。",
+        "type": "bool",
+        "default": false,
+        "condition": {
+            "enable_account_permission": true
+        }
+    },
+    "admin_accounts": {
+        "description": "一级权限名单（QQ 号）：拥有全部 Spotify 控制权限。",
+        "type": "list",
+        "default": [],
+        "condition": {
+            "enable_account_permission": true,
+            "enable_tier1_permission": true
+        }
+    },
+    "tier2_accounts": {
+        "description": "二级权限名单（QQ 号）：仅能搜索单曲、排队点歌。",
+        "type": "list",
+        "default": [],
+        "condition": {
+            "enable_account_permission": true,
+            "enable_tier1_permission": true,
+            "enable_tier2_permission": true
+        }
+    },
+    "enable_user_whitelist": {
+        "description": "已弃用：由“启用账号权限”取代。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "enable_regular_users": {
+        "description": "已弃用：由“启用二级权限”取代。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
     },
     "owner_accounts": {
-        "description": "号主账号：拥有全部 Spotify 插件权限。QQ填写QQ号，其他平台填写用户ID。",
+        "description": "已弃用：迁移为“一级权限名单”。",
         "type": "list",
         "default": [],
-        "condition": {"enable_user_whitelist": true}
+        "invisible": true
     },
     "user_accounts": {
-        "description": "普通用户账号：仅能搜索单曲、排队点歌。QQ填写QQ号，其他平台填写用户ID。",
+        "description": "已弃用：迁移为“二级权限名单”。",
         "type": "list",
         "default": [],
-        "condition": {"enable_user_whitelist": true, "enable_regular_users": true}
+        "invisible": true
     },
     "allowed_accounts": {
-        "description": "旧版号主列表兼容项。",
+        "description": "已弃用：旧版号主列表。",
         "type": "list",
         "default": [],
         "invisible": true
     },
     "preferred_device_id": {
-        "description": "优先唤醒的设备ID；留空仅使用已知设备",
+        "description": "优先唤醒的设备 ID；留空则使用已知设备",
         "type": "string",
         "default": ""
     },
     "allow_device_fallback": {
-        "description": "找不到已知设备时是否允许转移到第一台设备（谨慎启用）",
+        "description": "找不到已知设备时是否转移到第一台设备（谨慎启用）",
         "type": "bool",
         "default": false
     }
