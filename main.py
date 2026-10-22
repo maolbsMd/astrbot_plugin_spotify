@@ -2,7 +2,6 @@ import asyncio
 import functools
 import inspect
 import json
-import logging
 import os
 import re
 import secrets
@@ -19,6 +18,7 @@ from spotipy.cache_handler import CacheHandler
 from spotipy.oauth2 import SpotifyOAuth
 from urllib3.util import Retry
 
+from astrbot.api import logger
 from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api.star import StarTools
@@ -27,8 +27,6 @@ try:  # POSIX only; Windows keeps the in-process lock only.
     import fcntl
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
-
-logger = logging.getLogger("astrbot")
 
 # 设备缺失时的终态提示：明确告诉模型停下来，不要改用 Python/Shell 绕过。
 DEVICE_MISSING = (
@@ -175,7 +173,7 @@ def guarded_tool(func):
     return wrapped
 
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.5")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.6")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)

@@ -1,3 +1,8 @@
+# v1.4.6: 日志合规
+
+* 日志记录器改为 `from astrbot.api import logger`，移除 Python 内置 `logging` 模块与 `logging.getLogger`，符合插件审核规范。
+* 版本号同步至 1.4.6。
+
 # v1.4.5: 权限分级、设备选择与暂停恢复
 
 ### 权限（仅对 QQ 生效）
