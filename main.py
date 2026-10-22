@@ -356,7 +356,7 @@ class SpotifyController(Star):
             preferred = self.config.get("preferred_device_id", "")
             if preferred:
                 target_id = next((d.get("id") for d in devices if d.get("id") == preferred), None)
-            if not target_id and devices and self.config.get("allow_device_fallback", False):
+            if not target_id and devices and self.config.get("allow_device_fallback", True):
                 target_id = devices[0].get("id")
 
             if target_id:
@@ -595,9 +595,8 @@ class SpotifyController(Star):
                 return "操作失败：shuffle 状态必须是 true 或 false。"
 
             result_msg = ""
-            if action in ["resume", "play_context", "next", "previous"]:
-                if not await self._ensure_active_device():
-                    return "操作失败：没有可用的 Spotify 播放设备。"
+            if not await self._ensure_active_device():
+                return "操作失败：没有可用的 Spotify 播放设备。" + await self._get_passive_status()
 
             if action == "resume":
                 await asyncio.to_thread(self.sp.start_playback)
@@ -689,23 +688,28 @@ class SpotifyController(Star):
             uri, name = target_track["uri"], target_track["name"]
 
             if action == "queue":
-                # 直接入队，不查询、不改动当前播放上下文。
-                await asyncio.to_thread(self.sp.add_to_queue, uri)
+                if not await self._ensure_active_device():
+                    return "点歌失败：没有可用的 Spotify 播放设备。" + await self._get_passive_status()
+                dev_id = self.last_active_device_id
+                try:
+                    await asyncio.to_thread(self.sp.add_to_queue, uri, device_id=dev_id)
+                except Exception:
+                    await asyncio.to_thread(self.sp.add_to_queue, uri)
                 return f"✅ 已加入队尾：{name} - {artist}" + await self._get_passive_status()
 
-            # 还原 1.3.0 的轻量做法：入队后立即切歌，不做队列预检和结果复检。
-            playback = await asyncio.to_thread(self.sp.current_playback)
-            device = playback.get("device") if isinstance(playback, dict) else None
-            device_id = device.get("id") if isinstance(device, dict) else None
-            if device_id and device.get("is_active", True):
+            # 还原 1.3.0 的轻量做法：唤醒设备后入队并立即切歌，不做队列预检和结果复检。
+            if not await self._ensure_active_device():
+                return "点歌失败：没有可用的 Spotify 播放设备。" + await self._get_passive_status()
+            dev_id = self.last_active_device_id
+            try:
+                await asyncio.to_thread(self.sp.add_to_queue, uri, device_id=dev_id)
+            except Exception:
                 await asyncio.to_thread(self.sp.add_to_queue, uri)
+            await asyncio.sleep(0.3)
+            try:
+                await asyncio.to_thread(self.sp.next_track, device_id=dev_id)
+            except Exception:
                 await asyncio.to_thread(self.sp.next_track)
-            elif device_id:
-                # 设备存在但未激活：直接让它播放目标歌曲。
-                await asyncio.to_thread(self.sp.start_playback, uris=[uri], device_id=device_id)
-            else:
-                # 没有活跃会话时直接安全启动目标歌曲。
-                await asyncio.to_thread(self.sp.start_playback, uris=[uri])
             return f"⚡ 已切至：{name} - {artist}" + await self._get_passive_status()
 
         except Exception:
