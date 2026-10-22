@@ -1,3 +1,9 @@
+# v1.4.7: 审核合规清理
+
+* 显式导入 astrbot API（`llm_tool` / `logger` / `Context` / `Star` / `register` / `AstrMessageEvent`），移除 `from astrbot.api.all import *`。
+* 移除两处硬编码的 `/AstrBot/...` 回退路径：缓存只使用 `StarTools.get_data_dir`，配置只依赖 AstrBot 注入（本地直接导入时回退到插件目录 `config.json`）。
+* 版本号升至 1.4.7。
+
 # v1.4.6: 日志合规
 
 * 日志记录器改为 `from astrbot.api import logger`，移除 Python 内置 `logging` 模块与 `logging.getLogger`，符合插件审核规范。

@@ -18,10 +18,9 @@ from spotipy.cache_handler import CacheHandler
 from spotipy.oauth2 import SpotifyOAuth
 from urllib3.util import Retry
 
-from astrbot.api import logger
-from astrbot.api.all import *
-from astrbot.api.event import filter
-from astrbot.api.star import StarTools
+from astrbot.api import llm_tool, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, StarTools, register
 
 try:  # POSIX only; Windows keeps the in-process lock only.
     import fcntl
@@ -173,7 +172,7 @@ def guarded_tool(func):
     return wrapped
 
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.6")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.7")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -192,9 +191,8 @@ class SpotifyController(Star):
         if config:
             self.config = config
         else:
-            # AstrBot 标准配置路径（Docker 布局），不存在时回退到插件目录
-            data_cfg = Path("/AstrBot/data/config/astrbot_plugin_spotify_config.json")
-            config_path = data_cfg if data_cfg.exists() else Path(__file__).with_name("config.json")
+            # 正常运行时 AstrBot 会注入配置；这里只服务本地直接导入/调试。
+            config_path = Path(__file__).with_name("config.json")
             try:
                 with open(config_path, "r", encoding="utf-8-sig") as f:
                     self.config = json.load(f)
@@ -346,22 +344,9 @@ class SpotifyController(Star):
 
     def _get_cache_path(self) -> str:
         """获取符合 AstrBot 规范的数据持久化路径 data/plugin_data/<plugin>/.cache"""
-        data_dir = None
-        try:
-            data_dir = Path(StarTools.get_data_dir("astrbot_plugin_spotify"))
-            data_dir.mkdir(parents=True, exist_ok=True)
-            std_in_data = data_dir / ".cache"
-            if std_in_data.exists():
-                return str(std_in_data)
-        except Exception:
-            logger.warning("spotify: data dir unavailable, using fallback", exc_info=True)
-
-        fallback = Path("/AstrBot/data/plugin_data/astrbot_plugin_spotify/.cache")
-        if fallback.exists():
-            return str(fallback)
-        if data_dir is not None:
-            return str(data_dir / ".cache")
-        return str(fallback)
+        data_dir = Path(StarTools.get_data_dir("astrbot_plugin_spotify"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return str(data_dir / ".cache")
 
     def _setup_auth_manager(self):
         """加载配置并创建 SpotifyOAuth 实例（纯本地操作，无阻塞网络请求）"""
