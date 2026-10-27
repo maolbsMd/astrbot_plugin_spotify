@@ -1,3 +1,29 @@
+# v1.5.0: 搜索扩展、收藏增强与封面命令
+
+### 搜索（search_spotify_library）
+* 新增类型：`album`、`show`、`episode`、`artist_albums`（按歌手名列专辑）、`my_top_tracks`、`my_top_artists`。
+* 403 时明确提示“应用未获授权或接口已限制”，不再只报统一错误。
+
+### 收藏（manage_collection）
+* 新增 `save_album` / `remove_album`：收藏或取消整张专辑。
+* 新增 `follow_playlist` / `unfollow_playlist`：关注或取消关注歌单。
+* 新增 `save_queue`：把当前播放队列（含正在播放）保存成新的私有歌单，可自定义名称。
+* URI 统一转 ID 后再调用，避免部分端点只接受 ID 的问题。
+
+### 状态（check_current_playback）
+* `history` 参数（0-50）：返回账号最近播放，含播放时间。
+* 授权 scope 增加 `user-read-recently-played` 并与缓存 scope 合并。
+
+### 封面
+* `search_spotify_library` 新增 `cover` 类型：把当前曲目的专辑封面**作为图片**发到聊天（不是链接），不点不返回。
+* 二级权限用户也可以使用 `cover`（只读，低风险）。
+
+# v1.4.8: 最近播放
+
+* `check_current_playback` 新增 `history` 参数（0-50），返回账号最近播放曲目（含播放时间）。
+* 授权 scope 增加 `user-read-recently-played`，并与缓存 token 的 scope 合并：旧 token 继续可用，重新授权后获得新权限。
+* 缺少该权限时返回明确提示，引导重新执行 `/spotify登录`。
+
 # v1.4.7: 审核合规清理
 
 * 显式导入 astrbot API（`llm_tool` / `logger` / `Context` / `Star` / `register` / `AstrMessageEvent`），移除 `from astrbot.api.all import *`。

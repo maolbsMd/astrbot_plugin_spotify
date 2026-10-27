@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -172,7 +173,7 @@ def guarded_tool(func):
     return wrapped
 
 
-@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.4.7")
+@register("astrbot_plugin_spotify", "maolbsMd", "Spotify 智能点歌与控制插件", "1.5.0")
 class SpotifyController(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -271,13 +272,13 @@ class SpotifyController(Star):
             return True
         if level != "limited":
             return False
-        # 二级权限：只能搜单曲和排队点歌。
+        # 二级权限：单曲搜索、排队点歌、查看当前封面。
         if name == "quick_order_song":
             return arguments.get("action", "queue") == "queue"
         if name == "manage_playback":
             return arguments.get("action") == "queue"
         if name == "search_spotify_library":
-            return arguments.get("search_type", "track") == "track"
+            return arguments.get("search_type", "track") in {"track", "cover"}
         return False
 
     @staticmethod
@@ -377,15 +378,18 @@ class SpotifyController(Star):
             cache_handler = None
             cached = None
 
-        # 兼容已有缓存 token 的 scope，避免因代码追加新权限导致 validate_token 判定失效
+        required_scope = (
+            "user-read-playback-state user-modify-playback-state user-read-currently-playing "
+            "user-read-recently-played "
+            "playlist-read-private playlist-modify-public playlist-modify-private "
+            "user-library-read user-library-modify"
+        )
+        # 合并旧 token 的 scope 与当前代码需要的 scope：旧 token 继续可用，
+        # 重新授权时会一并申请新增权限（如历史播放）。
         if cached and cached.get("scope"):
-            scope = cached["scope"]
+            scope = " ".join(sorted(set(cached["scope"].split()) | set(required_scope.split())))
         else:
-            scope = (
-                "user-read-playback-state user-modify-playback-state user-read-currently-playing "
-                "playlist-read-private playlist-modify-public playlist-modify-private "
-                "user-library-read user-library-modify"
-            )
+            scope = required_scope
 
         self.auth_manager = LockedOAuth(
             client_id=client_id,
@@ -811,17 +815,49 @@ class SpotifyController(Star):
 
     @llm_tool(name="check_current_playback")
     @guarded_tool
-    async def check_current_playback(self, event: AstrMessageEvent) -> str:
+    async def check_current_playback(self, event: AstrMessageEvent, history: int = 0) -> str:
         """
-        主动查看当前 Spotify 播放状态、曲目信息，并列出账号下所有可用设备（主动视野）。
-        当用户询问“在播什么”“有哪些设备”“spotify状态”或 Bot 需要确认播放进度时调用。
+        主动查看当前 Spotify 播放状态、曲目信息、可用设备，以及最近播放（主动视野）。
+        当用户询问“在播什么”“有哪些设备”“我刚才听了什么”“spotify状态”时调用。
+
+        Args:
+            history(number): 可选，最近播放条数 0-50；0 表示不查询（默认）。
         """
         if not await self._ensure_sp():
             return "Spotify 未授权。"
         info = await self._get_playback_info()
         devices_line = await self._devices_text()
+
+        history_line = ""
+        try:
+            count = int(history)
+        except (TypeError, ValueError):
+            count = 0
+        count = max(0, min(count, 50))
+        if count > 0:
+            try:
+                recent = await asyncio.to_thread(self.sp.current_user_recently_played, limit=count)
+                rows = []
+                for idx, item in enumerate((recent or {}).get("items") or [], 1):
+                    track = (item or {}).get("track") or {}
+                    artists = ", ".join(a.get("name", "") for a in track.get("artists", []) if a)
+                    played_at = str((item or {}).get("played_at") or "").replace("T", " ")[:16]
+                    rows.append(f"{idx}. {track.get('name', '未知')} - {artists or '未知'} ({played_at})")
+                history_line = "\n- 最近播放：\n  " + "\n  ".join(rows) if rows else "\n- 最近播放：无记录"
+            except Exception as exc:
+                status = getattr(exc, "http_status", None)
+                if status == 403:
+                    history_line = (
+                        "\n- 最近播放：当前授权缺少 user-read-recently-played 权限，"
+                        "请重新执行 /spotify登录 授权"
+                    )
+                else:
+                    history_line = f"\n- 最近播放：读取失败（{_describe_error(exc)}）"
+
         if "track" not in info:
-            return f"当前状态：{info.get('status', '无活跃设备或休眠中')}。\n{devices_line}"
+            return (
+                f"当前状态：{info.get('status', '无活跃设备或休眠中')}。\n{devices_line}{history_line}"
+            )
 
         return (
             f"🎵 当前播放状态：\n"
@@ -832,6 +868,7 @@ class SpotifyController(Star):
             f"- 模式：随机 {info['shuffle']} / 循环 {info['repeat']}\n"
             f"- 即将播放：{info['upcoming']}\n"
             f"- {devices_line}"
+            f"{history_line}"
         )
 
     @llm_tool(name="manage_playback")
@@ -1126,15 +1163,21 @@ class SpotifyController(Star):
     async def search_spotify_library(
         self, event: AstrMessageEvent, keyword: str = "", search_type: str = "track", limit: int = 5
     ) -> str:
-        """Spotify 搜索与私人歌单探测器。
+        """Spotify 搜索与个人资料探测器。
 
         Args:
-            keyword(string): 搜索关键词。若查询自己的歌单(my_playlists)，此项可留空。
-            search_type(string): 搜索类型。可选: "track"(单曲), "playlist"(全网歌单), "artist"(歌手), "my_playlists"(用户私人歌单全量列表)。
-            limit(number): 返回结果数量上限，范围 1-50，默认 5。
+            keyword(string): 搜索关键词；my_playlists / my_top_tracks / my_top_artists 可留空。
+            search_type(string): 可选: "track"、"playlist"、"artist"、"album"、"show"、"episode"、
+                "artist_albums"（按关键词找歌手并列其专辑）、"my_top_tracks"、"my_top_artists"、
+                "my_playlists"、"cover"（把当前曲目的封面作为图片发到聊天）。
+            limit(number): 返回数量 1-50，默认 5。
         """
-        if search_type not in {"track", "playlist", "artist", "my_playlists"}:
-            return "不支持的搜索类型。"
+        allowed = {
+            "track", "playlist", "artist", "album", "show", "episode",
+            "artist_albums", "my_top_tracks", "my_top_artists", "my_playlists", "cover",
+        }
+        if search_type not in allowed:
+            return f"不支持的搜索类型：{search_type}"
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
             return "limit 必须是 1–50 的整数。"
         if not isinstance(keyword, str) or len(keyword) > 200:
@@ -1143,151 +1186,258 @@ class SpotifyController(Star):
             return "Spotify 未授权。"
         limit = max(1, min(limit, 50))
 
+        def artists_of(obj) -> str:
+            names = [a.get("name", "未知") for a in (obj or {}).get("artists", []) if a]
+            return ", ".join(names) if names else "未知"
+
         try:
-            response_text = ""
             if search_type == "my_playlists":
                 items = await asyncio.to_thread(self._fetch_all_user_playlists_sync)
                 if not items:
                     return "你的私人歌单库为空。" + await self._get_passive_status()
-
-                total_playlists = len(items)
+                total = len(items)
                 shown = items[:100]
-                suffix = "" if total_playlists <= len(shown) else f"，仅显示前 {len(shown)} 个"
-                response_text += f"🎵 用户的私人歌单列表 (共 {total_playlists} 个{suffix})：\n"
+                suffix = "" if total <= len(shown) else f"，仅显示前 {len(shown)} 个"
+                text = f"🎵 用户的私人歌单列表 (共 {total} 个{suffix})：\n"
                 for i, item in enumerate(shown):
                     if not item:
                         continue
-                    name = item.get("name", "未知歌单")
-                    tracks_info = item.get("tracks", {})
-                    total = tracks_info.get("total", 0) if tracks_info else 0
-                    uri = item.get("uri", "")
-                    response_text += f"{i + 1}. 歌单: {name} | 歌曲数: {total} | URI: {uri}\n"
+                    tracks = item.get("tracks") or {}
+                    text += f"{i + 1}. {item.get('name', '未知歌单')} | 歌曲数: {tracks.get('total', 0)} | {item.get('uri', '')}\n"
+                return text + await self._get_passive_status()
 
-            else:
+            if search_type == "my_top_tracks":
+                res = await asyncio.to_thread(self.sp.current_user_top_tracks, limit=limit)
+                items = (res or {}).get("items") or []
+                if not items:
+                    return "还没有足够的收听记录。" + await self._get_passive_status()
+                text = f"🎵 你最常听的 {len(items)} 首歌：\n"
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知')} - {artists_of(item)} [{item.get('uri', '')}]\n"
+                return text + await self._get_passive_status()
+
+            if search_type == "my_top_artists":
+                res = await asyncio.to_thread(self.sp.current_user_top_artists, limit=limit)
+                items = (res or {}).get("items") or []
+                if not items:
+                    return "还没有足够的收听记录。" + await self._get_passive_status()
+                text = f"🎵 你最常听的 {len(items)} 位歌手：\n"
+                for i, item in enumerate(items):
+                    genres = ", ".join((item.get("genres") or [])[:2])
+                    suffix = f"（{genres}）" if genres else ""
+                    text += f"{i + 1}. {item.get('name', '未知')}{suffix} [{item.get('uri', '')}]\n"
+                return text + await self._get_passive_status()
+
+            if search_type == "artist_albums":
                 if not keyword:
-                    return "搜索全网资源必须提供 keyword。" + await self._get_passive_status()
-                results = await asyncio.to_thread(
-                    self.sp.search, q=keyword, limit=limit, type=search_type, market="from_token"
+                    return "artist_albums 需要提供歌手名。"
+                found = await asyncio.to_thread(self.sp.search, q=keyword, limit=1, type="artist")
+                artists = ((found or {}).get("artists") or {}).get("items") or []
+                if not artists:
+                    return f"没找到歌手 '{keyword}'。"
+                artist = artists[0]
+                res = await asyncio.to_thread(
+                    self.sp.artist_albums, artist["id"], album_type="album", limit=limit
                 )
-                if not results:
-                    return f"未搜到 '{keyword}' 的相关结果。" + await self._get_passive_status()
+                items = (res or {}).get("items") or []
+                if not items:
+                    return f"{artist.get('name')} 没有可列出的专辑。"
+                text = f"🎵 {artist.get('name')} 的专辑：\n"
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知')} ({item.get('release_date', '?')}) [{item.get('uri', '')}]\n"
+                return text + await self._get_passive_status()
 
-                response_text += f"🎵 '{keyword}' 的 {search_type} 搜索结果：\n"
+            if search_type == "cover":
+                playback = await asyncio.to_thread(self.sp.current_playback)
+                item = ((playback or {}).get("item")) or {}
+                images = ((item.get("album") or {}).get("images")) or []
+                if not images:
+                    return "当前没有可用的封面（可能没有在播放）。" + await self._get_passive_status()
+                url = images[0].get("url") or ""
+                if not url:
+                    return "封面地址为空。" + await self._get_passive_status()
+                try:
+                    await event.send(event.image_result(url).chain)
+                except Exception:
+                    logger.exception("spotify: cover send failed")
+                    return "封面发送失败：当前平台可能不支持直接发图。" + await self._get_passive_status()
+                return f"🖼️ 已发送封面：{item.get('name', '当前曲目')}" + await self._get_passive_status()
 
-                if search_type == "track":
-                    tracks_obj = results.get("tracks", {})
-                    items = tracks_obj.get("items", []) if tracks_obj else []
-                    if not items:
-                        return "没有找到相关单曲。" + await self._get_passive_status()
+            if not keyword:
+                return "搜索全网资源必须提供 keyword。"
+            results = await asyncio.to_thread(
+                self.sp.search, q=keyword, limit=limit, type=search_type, market="from_token"
+            )
+            if not results:
+                return f"未搜到 '{keyword}' 的相关结果。" + await self._get_passive_status()
 
-                    for i, item in enumerate(items):
-                        if not item:
-                            continue
-                        name = item.get("name", "未知")
-                        artists = ", ".join(
-                            [a.get("name", "未知") for a in item.get("artists", []) if a]
-                        )
-                        uri = item.get("uri", "")
-                        response_text += f"{i + 1}. {name} - {artists} [{uri}]\n"
+            text = f"🎵 '{keyword}' 的 {search_type} 搜索结果：\n"
+            if search_type == "track":
+                items = ((results.get("tracks") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知')} - {artists_of(item)} [{item.get('uri', '')}]\n"
+            elif search_type == "playlist":
+                items = ((results.get("playlists") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    owner = ((item.get("owner") or {}).get("display_name")) or "未知"
+                    text += f"{i + 1}. {item.get('name', '未知歌单')} (创建者:{owner}) [{item.get('uri', '')}]\n"
+            elif search_type == "artist":
+                items = ((results.get("artists") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知歌手')} [{item.get('uri', '')}]\n"
+            elif search_type == "album":
+                items = ((results.get("albums") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知专辑')} - {artists_of(item)} ({item.get('release_date', '?')}) [{item.get('uri', '')}]\n"
+            elif search_type == "show":
+                items = ((results.get("shows") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    text += f"{i + 1}. {item.get('name', '未知节目')} (发布:{item.get('publisher', '未知')}) [{item.get('uri', '')}]\n"
+            elif search_type == "episode":
+                items = ((results.get("episodes") or {}).get("items")) or []
+                for i, item in enumerate(items):
+                    show = (item.get("show") or {}).get("name", "未知节目")
+                    text += f"{i + 1}. {item.get('name', '未知单集')} (来自:{show}) [{item.get('uri', '')}]\n"
 
-                elif search_type == "playlist":
-                    playlists_obj = results.get("playlists", {})
-                    items = playlists_obj.get("items", []) if playlists_obj else []
-                    if not items:
-                        return "没有找到相关歌单。" + await self._get_passive_status()
-
-                    for i, item in enumerate(items):
-                        if not item:
-                            continue
-                        name = item.get("name", "未知歌单")
-                        owner_obj = item.get("owner", {})
-                        owner = owner_obj.get("display_name", "未知") if owner_obj else "未知"
-                        uri = item.get("uri", "")
-                        response_text += f"{i + 1}. {name} (创建者:{owner}) [{uri}]\n"
-
-                elif search_type == "artist":
-                    artists_obj = results.get("artists", {})
-                    items = artists_obj.get("items", []) if artists_obj else []
-                    if not items:
-                        return "没有找到相关歌手。" + await self._get_passive_status()
-
-                    for i, item in enumerate(items):
-                        if not item:
-                            continue
-                        name = item.get("name", "未知歌手")
-                        uri = item.get("uri", "")
-                        response_text += f"{i + 1}. {name} [{uri}]\n"
-
-            return response_text + await self._get_passive_status()
+            if text.count("\n") <= 1:
+                return f"没有找到相关{search_type}结果。" + await self._get_passive_status()
+            return text + await self._get_passive_status()
         except Exception as exc:
             logger.exception("spotify: search failed (type=%s)", search_type)
+            if getattr(exc, "http_status", None) == 403:
+                return (
+                    f"该搜索类型（{search_type}）被 Spotify 拒绝：应用未获授权或接口已限制。"
+                    + await self._get_passive_status()
+                )
             return f"搜索失败（{_describe_error(exc)}），详情见 AstrBot 日志。" + await self._get_passive_status()
 
     @llm_tool(name="manage_collection")
     @guarded_tool
     async def manage_collection(
-        self, event: AstrMessageEvent, track_uri: str, playlist_uri: str = "", action: str = "add"
+        self,
+        event: AstrMessageEvent,
+        action: str = "add",
+        track_uri: str = "",
+        playlist_uri: str = "",
+        album_uri: str = "",
+        playlist_name: str = "",
     ) -> str:
-        """音乐收藏与歌单归类/移除工具。
+        """音乐收藏、歌单关注与队列存档。
 
         Args:
-            track_uri(string): 歌曲 URI，支持多首歌曲用英文逗号分隔（如 "uri1,uri2"）。
-            playlist_uri(string): 目标歌单的 URI。留空则代表操作用户的“喜欢的音乐”。
-            action(string): 操作动作。可选: "add"(添加收藏，默认), "remove"(移除收藏)。
+            action(string): "add"/"remove"（歌曲收藏或歌单曲目）、"save_album"/"remove_album"、
+                "follow_playlist"/"unfollow_playlist"、"save_queue"（把当前队列存成新歌单）。
+            track_uri(string): 歌曲 URI，逗号分隔，最多 50 首（add/remove 用）。
+            playlist_uri(string): 歌单 URI：add/remove 的目标，或 follow/unfollow 的对象。
+            album_uri(string): 专辑 URI（save_album/remove_album 用）。
+            playlist_name(string): save_queue 时新歌单名称，留空自动生成。
         """
-        if action not in {"add", "remove"}:
-            return "不支持的收藏操作。"
-        if not isinstance(track_uri, str) or len(track_uri) > 4000:
-            return "歌曲 URI 无效。"
-        checked = [u.strip() for u in track_uri.split(",")]
-        if not 1 <= len(checked) <= 50 or not all(self._valid_uri(u, {"track"}) for u in checked):
-            return "仅接受 1–50 个完整歌曲 URI。"
-        if playlist_uri and not self._valid_uri(playlist_uri, {"playlist"}):
-            return "歌单 URI 无效。"
+        actions = {
+            "add", "remove", "save_album", "remove_album",
+            "follow_playlist", "unfollow_playlist", "save_queue",
+        }
+        if action not in actions:
+            return f"不支持的收藏操作：{action}"
         if not await self._ensure_sp():
             return "Spotify 未授权。" + await self._get_passive_status()
 
+        def to_id(value: str) -> str:
+            return value.rsplit(":", 1)[-1] if value.startswith("spotify:") else value
+
         try:
+            if action in {"follow_playlist", "unfollow_playlist"}:
+                if not self._valid_uri(playlist_uri, {"playlist"}):
+                    return "歌单 URI 无效。"
+                if action == "follow_playlist":
+                    await asyncio.to_thread(self.sp.current_user_follow_playlist, to_id(playlist_uri))
+                    return "✅ 已关注该歌单。" + await self._get_passive_status()
+                await asyncio.to_thread(self.sp.current_user_unfollow_playlist, to_id(playlist_uri))
+                return "✅ 已取消关注该歌单。" + await self._get_passive_status()
+
+            if action in {"save_album", "remove_album"}:
+                if not self._valid_uri(album_uri, {"album"}):
+                    return "专辑 URI 无效。"
+                if action == "save_album":
+                    await asyncio.to_thread(self.sp.current_user_saved_albums_add, albums=[to_id(album_uri)])
+                    return "✅ 已收藏该专辑。" + await self._get_passive_status()
+                await asyncio.to_thread(self.sp.current_user_saved_albums_delete, albums=[to_id(album_uri)])
+                return "✅ 已取消收藏该专辑。" + await self._get_passive_status()
+
+            if action == "save_queue":
+                data = await asyncio.to_thread(self.sp.queue) or {}
+                uris = []
+                current = data.get("currently_playing") or {}
+                if isinstance(current, dict) and current.get("uri"):
+                    uris.append(current["uri"])
+                for item in data.get("queue") or []:
+                    if isinstance(item, dict) and item.get("uri") and item["uri"] not in uris:
+                        uris.append(item["uri"])
+                if not uris:
+                    return "队列是空的，没什么可保存的。" + await self._get_passive_status()
+                name = (playlist_name or "").strip() or f"队列 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                created = await asyncio.to_thread(
+                    self.sp.current_user_playlist_create,
+                    name=name,
+                    public=False,
+                    description="由 AstrBot 保存的播放队列",
+                )
+                playlist_id = (created or {}).get("id")
+                if not playlist_id:
+                    return "创建歌单失败。" + await self._get_passive_status()
+                for i in range(0, len(uris), 100):
+                    await asyncio.to_thread(
+                        self.sp.playlist_add_items,
+                        playlist_id=playlist_id,
+                        items=uris[i:i + 100],
+                    )
+                return (
+                    f"✅ 已把 {len(uris)} 首歌保存为新歌单「{name}」。"
+                    + await self._get_passive_status()
+                )
+
+            if not isinstance(track_uri, str) or len(track_uri) > 4000:
+                return "歌曲 URI 无效。"
             track_uris = [u.strip() for u in track_uri.split(",") if u.strip()]
-            if not track_uris:
-                return "操作失败：未提供有效的 track_uri。"
+            if not 1 <= len(track_uris) <= 50 or not all(self._valid_uri(u, {"track"}) for u in track_uris):
+                return "仅接受 1–50 个完整歌曲 URI。"
+            if playlist_uri and not self._valid_uri(playlist_uri, {"playlist"}):
+                return "歌单 URI 无效。"
 
             if action == "remove":
                 if not playlist_uri:
-                    await asyncio.to_thread(
-                        self.sp.current_user_saved_tracks_delete, tracks=track_uris
-                    )
+                    await asyncio.to_thread(self.sp.current_user_saved_tracks_delete, tracks=track_uris)
                     return (
                         f"✅ 已成功将 {len(track_uris)} 首歌曲从「喜欢的音乐」中移除！"
                         + await self._get_passive_status()
                     )
-                else:
-                    await asyncio.to_thread(
-                        self.sp.playlist_remove_all_occurrences_of_items,
-                        playlist_id=playlist_uri,
-                        items=track_uris,
-                    )
-                    return (
-                        f"✅ 已成功将 {len(track_uris)} 首歌曲从指定歌单中移除！"
-                        + await self._get_passive_status()
-                    )
-            else:
-                if not playlist_uri:
-                    await asyncio.to_thread(
-                        self.sp.current_user_saved_tracks_add, tracks=track_uris
-                    )
-                    return (
-                        f"✅ 已成功将 {len(track_uris)} 首歌曲加入「喜欢的音乐」收藏夹！"
-                        + await self._get_passive_status()
-                    )
-                else:
-                    await asyncio.to_thread(
-                        self.sp.playlist_add_items, playlist_id=playlist_uri, items=track_uris
-                    )
-                    return (
-                        f"✅ 已成功将 {len(track_uris)} 首歌曲加入到指定歌单中！"
-                        + await self._get_passive_status()
-                    )
+                await asyncio.to_thread(
+                    self.sp.playlist_remove_all_occurrences_of_items,
+                    playlist_id=to_id(playlist_uri),
+                    items=track_uris,
+                )
+                return (
+                    f"✅ 已成功将 {len(track_uris)} 首歌曲从指定歌单中移除！"
+                    + await self._get_passive_status()
+                )
+
+            if not playlist_uri:
+                await asyncio.to_thread(self.sp.current_user_saved_tracks_add, tracks=track_uris)
+                return (
+                    f"✅ 已成功将 {len(track_uris)} 首歌曲加入「喜欢的音乐」收藏夹！"
+                    + await self._get_passive_status()
+                )
+            await asyncio.to_thread(
+                self.sp.playlist_add_items, playlist_id=to_id(playlist_uri), items=track_uris
+            )
+            return (
+                f"✅ 已成功将 {len(track_uris)} 首歌曲加入到指定歌单中！"
+                + await self._get_passive_status()
+            )
         except Exception as exc:
             logger.exception("spotify: collection change failed (action=%s)", action)
+            if getattr(exc, "http_status", None) == 403:
+                return (
+                    f"该操作被 Spotify 拒绝（应用未获授权或接口已限制）：{action}。"
+                    + await self._get_passive_status()
+                )
             return f"歌单操作失败（{_describe_error(exc)}），详情见 AstrBot 日志。" + await self._get_passive_status()
